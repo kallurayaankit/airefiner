@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import traceback
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template_string
@@ -16,6 +17,10 @@ if not api_key:
 client = genai.Client(api_key=api_key)
 
 MODEL = "gemini-3.6-flash"
+
+# Models to try in order if one is busy
+FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+
 
 # ---------- Fast local cleanup (no AI needed) ----------
 def clean_symbols(text):
@@ -59,7 +64,7 @@ HTML = """
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Free AI Refiner</title>
+  <title>AIrefiner</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -93,12 +98,11 @@ HTML = """
     .secondary { background: #eee; color: #111; }
     .status { font-size: 13px; color: #666; margin-left: 8px; }
     .row { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
-    .tick { color: #0a7c2f; font-weight: 600; font-size: 13px; }
   </style>
 </head>
 <body>
-  <h1>Free AI Refiner</h1>
-  <p class="sub">Paste AI text. Pick a tone and strength. Click AI Refiner.</p>
+  <h1>AIrefiner</h1>
+  <p class="sub">AIrefiner — paste AI text, pick a tone, refine it into natural human writing.</p>
 
   <div class="grid">
     <textarea id="input" placeholder="Paste AI text here..."></textarea>
@@ -232,17 +236,38 @@ Rules:
 Text to rewrite:
 {text}"""
 
-    # Step 3: call the AI
-    try:
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=prompt
-        )
-        result = (response.text or "").strip()
-        return jsonify({"result": result})
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    # Step 3: call the AI, with retry + fallback models
+    last_error = None
+    for model_name in FALLBACK_MODELS:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                result = (response.text or "").strip()
+                return jsonify({"result": result})
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                is_busy = (
+                    "503" in err_str
+                    or "unavailable" in err_str
+                    or "429" in err_str
+                    or "rate" in err_str
+                    or "overloaded" in err_str
+                )
+                if is_busy:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                else:
+                    break  # don't retry this model, try the next one
+
+    traceback.print_exc()
+    return jsonify({
+        "error": "All models are busy right now. Please try again in a moment. "
+                 f"Last error: {last_error}"
+    }), 503
 
 
 if __name__ == "__main__":
